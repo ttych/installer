@@ -6,4 +6,4 @@ PRELUDE_URL="${PRELUDE_URL:-https://github.com/bbatsov/prelude.git}"
 PRELUDE_INSTALL_DIR="${PRELUDE_INSTALL_DIR:-$HOME/.emacs.d}"
 
 export PRELUDE_URL PRELUDE_INSTALL_DIR &&
-    curl -sSL "${PRELUDE_URL%.git}/raw/master/utils/installer.sh}" | sh
+    curl -sSL "${PRELUDE_URL%.git}/raw/master/utils/installer.sh" | sh
