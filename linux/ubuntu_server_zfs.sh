@@ -135,6 +135,50 @@ zfs_system_create_bpool_datasets()
     zfs mount $BPOOL/Boot/ubuntu
 }
 
+zfs_share_service()
+{
+    cat <<EOF > /etc/zfs/import_custom.sh
+#!/bin/sh
+
+SCRIPT_PATH="\${0%/*}"
+CUSTOM_POOLS=\${SCRIPT_PATH}/custom_pools
+
+[ -r "\$CUSTOM_POOLS" ] || return 0
+
+while read pool_info; do
+    pool_args="\${pool_info% [A-Za-z]*}"
+    pool_name="\${pool_info#\$pool_args }"
+    zpool status \$pool_name >/dev/null 2>/dev/null && continue
+    zpool import \$pool_info
+done <  "\$CUSTOM_POOLS"
+EOF
+
+    chmod +x /etc/zfs/import_custom.sh
+    touch /etc/zfs/custom_pools
+
+    cat <<EOF > /etc/systemd/system/zfs-import-custom.service
+[Unit]
+DefaultDependencies=no
+Before=zfs-import-scan.service
+Before=zfs-import-cache.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/etc/zfs/import_custom.sh
+
+[Install]
+WantedBy=zfs-import.target
+EOF
+
+    systemctl enable zfs-import-custom.service
+}
+
+zfs_share_create()
+{
+    echo zdata > /etc/zfs/custom_pools
+}
+
 system_install_pkgs()
 {
     apt -qq update
@@ -550,6 +594,19 @@ do_reboot()
     reboot
 }
 
+do_share()
+{
+    if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+        echo specify 1 or 2 disks to build share system :
+        disk_list
+        return 1
+    fi
+
+    zfs_share_service &&
+        zfs_share_create
+}
+
+
 usage()
 {
     cat <<EOF
@@ -590,6 +647,9 @@ case "$action" in
         ;;
     efibootmgr)
         system_efibootmgr
+        ;;
+    share)
+        do_share "$@"
         ;;
     *)
         usage
