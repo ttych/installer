@@ -33,8 +33,13 @@ disk_format_system() # disk
 
 disk_format_full_zfs()
 {
-    # FIXME
-    :
+    disk_wipe "$1" &&
+        sgdisk -a1 -n1:0:0 -t1:BF01 "$1"
+
+    partprobe "$1"
+    sleep 1
+
+    [ -e "${1}-part1" ] || return 1
 }
 
 disk_list()
@@ -110,7 +115,7 @@ zfs_system_create_rpool_datasets()
     zfs create                                 $RPOOL/Linux/ubuntu/var/lib
     zfs create                                 $RPOOL/Linux/ubuntu/var/log
     zfs create                                 $RPOOL/Linux/ubuntu/var/spool
-    zfs create -o com.sun:auto-snapshot=false  $RPOOL/Linux/ubuntu/var/cach
+    zfs create -o com.sun:auto-snapshot=false  $RPOOL/Linux/ubuntu/var/cache
     zfs create                                 $RPOOL/Linux/ubuntu/var/mail
     zfs create                                 $RPOOL/Linux/ubuntu/var/snap
     zfs create                                 $RPOOL/Linux/ubuntu/var/www
@@ -119,7 +124,7 @@ zfs_system_create_rpool_datasets()
     zfs create -o com.sun:auto-snapshot=false  $RPOOL/Linux/ubuntu/var/tmp
     chmod 1777 $MNT/var/tmp
 
-    zfs create -o com.sun:auto-snapshot=false -o canmount=noauto $RPOOL/Linux/ubuntu/tmp
+    zfs create -o com.sun:auto-snapshot=false  $RPOOL/Linux/ubuntu/tmp
     mkdir $MNT/tmp
     chmod 1777 $MNT/tmp
 
@@ -135,7 +140,7 @@ zfs_system_create_bpool_datasets()
     zfs mount $BPOOL/Boot/ubuntu
 }
 
-zfs_share_service()
+zfs_custom_service()
 {
     cat <<EOF > /etc/zfs/import_custom.sh
 #!/bin/sh
@@ -176,7 +181,18 @@ EOF
 
 zfs_share_create()
 {
-    echo zdata > /etc/zfs/custom_pools
+    disk_format_full_zfs "$1" &&
+        disk_format_full_zfs "$2" &&
+        zpool create \
+              -o ashift=12 \
+              -O dnodesize=auto \
+              -O compression=lz4 \
+              -O mountpoint=legacy \
+              -O atime=off \
+              -O acltype=posixacl \
+              zdata mirror "${1}-part1" "${2}-part1" &&
+        echo zdata > /etc/zfs/custom_pools &&
+        zfs create -o mountpoint=/share -o sharenfs=off zdata/share
 }
 
 system_install_pkgs()
@@ -190,6 +206,7 @@ system_install_pkgs()
     apt -qq --yes install parted gdisk
     apt -qq --yes install openssh-server
     apt -qq --yes install --no-install-recommends linux-image-generic
+    apt -qq --yes install nfs-kernel-server
     apt -qq --yes install zfs-initramfs
 }
 
@@ -259,13 +276,35 @@ EOF
 
 system_tmpfs()
 {
-    cp /usr/share/systemd/tmp.mount /etc/systemd/system/
-    systemctl enable tmp.mount
+    #cp /usr/share/systemd/tmp.mount /etc/systemd/system/
+    #systemctl enable tmp.mount
+    echo "tmpfs     /tmp     tmpfs     defaults,size=256M,mode=1777,noauto     0     0" >> /etc/fstab
+
+    cat <<EOF > /etc/systemd/system/tmp.service
+[Unit]
+Description=Mount /tmp late
+DefaultDependencies=no
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/mount /tmp
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target
+EOF
+
+    systemctl enable tmp.service
 }
 
 system_user_admin()
 {
-    adduser --uid 2001 admin
+    adduser --uid 2001 \
+            --disabled-password \
+            --gecos 'admin &' \
+            --no-create-home \
+            admin
 
     cat <<EOF > /etc/sudoers.d/admin
 %admin ALL=(ALL) NOPASSWD: ALL
@@ -273,6 +312,7 @@ EOF
 
     chmod 0400 /etc/sudoers.d/admin
 
+    mkdir -p /home/admin/scripts
     mkdir -p /home/admin/.ssh
     chown -R admin:admin /home/admin
     chmod 0700 /home/admin
@@ -282,6 +322,7 @@ EOF
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDrONQB0piHJSoV+k515dk8Y4V2JVGsp+ZPQh/w9GtAV 20190731-083859
 EOF
     chmod 0600 /home/admin/.ssh/authorized_keys
+    chown -R admin:admin /home/admin
 }
 
 system_snapshot()
@@ -324,7 +365,16 @@ EOF
     mount | grep /boot/efi || mount /boot/efi
 }
 
-system_grub()
+system_efi_simple()
+{
+    ln -sf /proc/self/mounts /etc/mtab
+    mkdosfs -F 32 -s 1 -n EFI ${1}-part2
+    mkdir -p /boot/efi
+    echo PARTUUID=$(blkid -s PARTUUID -o value ${1}-part2) /boot/efi vfat nofail,x-systemd.device-timeout=1 0 1 >> /etc/fstab
+    mount /boot/efi
+}
+
+system_grub_efi()
 {
     apt -qq install --yes grub-efi-amd64-signed shim-signed
 
@@ -350,16 +400,24 @@ EOF
 
     update-grub
 
-    mv /bin/efibootmgr /bin/efibootmgr.real
-    (cd /bin ; ln -sf efibootmgr.sh efibootmgr)
+    if [ "$1" = "raid" ]; then
+        mv /bin/efibootmgr /bin/efibootmgr.real
+        (cd /bin ; ln -sf efibootmgr.sh efibootmgr)
+    fi
 
     grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck --no-floppy
 
     umount /boot/efi
+
+    if [ "$1" = "simple" ]; then
+        dd if="${2}-part2" of="${3}-part2"
+        efibootmgr -c -g -d "${3}" -p 3 -L "ubuntu-2" -l '\EFI\ubuntu\grubx64.efi'
+    fi
+
     zfs set mountpoint=legacy bpool/Boot/ubuntu
 }
 
-system_efibootmgr()
+system_bin_efitbootmgr_sh()
 {
     cat <<EOF > /bin/efibootmgr.sh
 #!/bin/sh
@@ -578,12 +636,24 @@ do_postinstall()
         system_reconfigure &&
         system_boot &&
         system_tmpfs &&
-        system_efi_raid "$1" "$2" &&
-        system_efibootmgr &&
-        system_grub &&
-        system_disable_log_compression &&
-        root_passwd &&
+        system_efi_simple "$1" "$2" &&
+        system_grub_efi simple "$1" "$2"
+        system_disable_log_compression
+        system_user_admin
+        root_passwd
         do_set_systemctl_default
+}
+
+do_efi_simple()
+{
+    if [ $# -ne 2 ]; then
+        echo "Please specify 2 disks for system install :"
+        disk_list
+        return 1
+    fi
+
+    system_efi_simple "$1" "$2" &&
+        system_grub_efi simple "$1" "$2"
 }
 
 do_reboot()
@@ -602,8 +672,8 @@ do_share()
         return 1
     fi
 
-    zfs_share_service &&
-        zfs_share_create
+    zfs_custom_service &&
+        zfs_share_create "$1" "$2"
 }
 
 
@@ -620,6 +690,10 @@ With action in :
     p | postinstall
     s | sethostid
     r | reboot
+        efibootmgr_hack
+        share
+        user_admin
+        efi_simple
 EOF
 }
 
@@ -645,11 +719,17 @@ case "$action" in
     r|reboot)
         do_reboot
         ;;
-    efibootmgr)
-        system_efibootmgr
+    efibootmgr_hack)
+        system_bin_efitbootmgr_sh
         ;;
     share)
         do_share "$@"
+        ;;
+    user_admin)
+        system_user_admin
+        ;;
+    efi_simple)
+        do_efi_simple "$@"
         ;;
     *)
         usage
